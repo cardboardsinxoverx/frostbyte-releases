@@ -205,6 +205,11 @@ jobs:
             [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
             [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
             [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+            public static string Size(IntPtr h) {
+              RECT r;
+              if (h == IntPtr.Zero || !GetWindowRect(h, out r)) return "-";
+              return (r.R - r.L) + "x" + (r.B - r.T);
+            }
             public static Bitmap Grab(IntPtr h) {
               RECT r;
               if (!GetWindowRect(h, out r)) return null;
@@ -271,6 +276,15 @@ jobs:
             }
             return $null
           }
+          # fb_splash's per-stage boot times (boot_timings.json in the app's
+          # cache; this install's cache is in-tree). Kept per launch: each boot
+          # after the first is blended into the file (half old, half new).
+          function KeepTimings($label) {
+            $f = @(Get-ChildItem "$dir\app\cache", "$env:LOCALAPPDATA\FrostByte", "$env:APPDATA\frostbyte" `
+                     -Filter boot_timings.json -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($f.Count) { Copy-Item $f[0].FullName "$out\boot_timings-$label.json" }
+            else { Write-Host "no boot_timings.json after $label" }
+          }
           # Stop everything from the install; the count still running after.
           function StopAll {
             foreach ($i in 1..4) {
@@ -284,7 +298,7 @@ jobs:
           function Watch($label, $seconds, $shots) {
             $t0 = Get-Date
             Start-Process "$dir\launch.bat" -WorkingDirectory $dir
-            $app = $null; $end = "still running after $seconds s"; $lines = @()
+            $app = $null; $mainAt = $null; $end = "still running after $seconds s"; $lines = @()
             # procs-<label>.txt: every install process as it first appears, so
             # a crash event's pid can be named (a lane, Chromium, the app).
             $born = @{}; $census = @()
@@ -314,9 +328,14 @@ jobs:
               if ($app) { $alive = Get-Process -Id $app.Id -ErrorAction SilentlyContinue }
               if ($alive) {
                 $mb = [int]($alive.WorkingSet64 / 1MB)
+                # The loading box is ~556x289; the main window is the first
+                # wide one. Its first sighting is when the boot finished.
+                $win = "-"
+                if ($canGrab) { $win = [WinShot]::Size($alive.MainWindowHandle) }
+                if (-not $mainAt -and $win -match '^(\d+)x' -and [int]$Matches[1] -gt 900) { $mainAt = $s }
                 $kids = @($procs | Where-Object { $_.ParentProcessId -eq $app.Id }).Count
                 $all = [int](($procs | Measure-Object -Property WorkingSetSize -Sum).Sum / 1MB)
-                $lines += "{0,4} s  up    app {1,5} MB  children {2,2}  all {3,3} procs {4,5} MB  free {5,6} MB  | {6}" -f $s, $mb, $kids, $procs.Count, $all, $free, $last
+                $lines += "{0,4} s  up    win {1,-9} app {2,5} MB  children {3,2}  all {4,3} procs {5,5} MB  free {6,6} MB  | {7}" -f $s, $win, $mb, $kids, $procs.Count, $all, $free, $last
               } elseif ($app) {
                 $lines += "{0,4} s  GONE  {1,3} procs left  free {2,6} MB  | {3}" -f $s, $procs.Count, $free, $last
                 $end = "DIED about $s s after launch ($($app.Name) pid $($app.Id))"
@@ -332,6 +351,7 @@ jobs:
             }
             if (-not $app) { $end = "NEVER STARTED (nothing from the install ran frostbyte_gui.py, and its log names no live pid)" }
             elseif ($end -like "still running*") { $end += " ($($app.Name) pid $($app.Id), found by $($app.By))" }
+            if ($app) { $end += $(if ($mainAt) { "; main window by $mainAt s" } else { "; never left the loading box" }) }
             Shot "$label-end" $(if ($app) { $app.Id })
             $lines += "==> $label : $end"
             $lines | Out-File "$out\timeline-$label.txt" -Encoding utf8
@@ -342,6 +362,7 @@ jobs:
           $first = Watch "launch1" ([int]$env:WATCH_S) @(20, 45, 90, 150, 240, 330)
           $left = StopAll
           if ($left) { Write-Host "::warning::$left process(es) from launch 1 would not stop" }
+          KeepTimings "launch1"
           # A launch WE ended must not look like a crash to the next one (0.6.2+
           # would stop on its "didn't finish starting" box, which nobody clicks).
           # One that died on its own keeps its record: launch 2 should report it.
@@ -352,6 +373,7 @@ jobs:
           $second = Watch "launch2" 240 @(30, 90, 180)
           $left = StopAll
           if ($left) { Write-Host "::warning::$left process(es) from launch 2 would not stop" }
+          KeepTimings "launch2"
           "launch 1: $first`nlaunch 2: $second" | Out-File "$out\outcome.txt" -Encoding utf8
           # .NET writes UTF-8 without a BOM; 5.1's Out-File would add one.
           [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "first=$first`n")
@@ -432,6 +454,21 @@ jobs:
           foreach ($f in "timeline-launch1.txt", "timeline-launch2.txt", "imports.txt", "webengine-software.txt", "webengine-gpu.txt") {
             if (Test-Path "$out\$f") { $sum += "", "### $f", '```'; $sum += Get-Content "$out\$f" -TotalCount 80; $sum += '```' }
           }
+          # Boot stages, seconds. Launch 1 is a first boot (its file is raw);
+          # launch 2 is backed out of the blend: new = 2 * blended - first.
+          $t1 = $null; $t2 = $null
+          if (Test-Path "$out\boot_timings-launch1.json") { $t1 = Get-Content "$out\boot_timings-launch1.json" -Raw | ConvertFrom-Json }
+          if (Test-Path "$out\boot_timings-launch2.json") { $t2 = Get-Content "$out\boot_timings-launch2.json" -Raw | ConvertFrom-Json }
+          if ($t1) {
+            $sum += "", "### Boot stages (s)", '```', ("{0,-16} {1,9} {2,9}" -f "stage", "launch 1", "launch 2")
+            foreach ($k in $t1.order) {
+              $a = $t1.stages.$k.mean; $b = ""
+              if ($t2 -and $t2.stages.$k) { $b = "{0:N1}" -f (2 * $t2.stages.$k.mean - $a) }
+              $sum += "{0,-16} {1,9:N1} {2,9}" -f $k, $a, $b
+            }
+            $sum += "{0,-16} {1,9:N1} {2,9}" -f "total", $t1.last_total_s, $(if ($t2) { "{0:N1}" -f $t2.last_total_s })
+            $sum += '```'
+          }
           $crash = Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "Application Error"; StartTime = $start } -ErrorAction SilentlyContinue
           $sum += "", "### Application Error events: $(@($crash).Count)"
           foreach ($c in @($crash | Select-Object -First 5)) {
@@ -471,4 +508,5 @@ jobs:
         run: |
           $o = Get-Content (Join-Path $env:RUNNER_TEMP "arm-check\outcome.txt") -Raw
           Write-Host $o
+          if ($o -match "never left the loading box") { Write-Host "::warning::a launch was still on the loading box when the watch ended" }
           if ($o -match "DIED|NEVER STARTED") { throw "FrostByte did not stay up on Windows on ARM" }
