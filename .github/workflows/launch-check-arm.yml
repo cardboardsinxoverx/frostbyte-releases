@@ -1,0 +1,474 @@
+name: launch-check-arm
+
+# Installs a PUBLISHED FrostByte installer from this repo on a Windows-on-ARM
+# runner, starts it the way a user would, and keeps everything that says how
+# it went.
+#
+# WHY. 2026-09-29: a tester's Surface Pro (Snapdragon, Windows on ARM) showed
+# the loading screen and then FrostByte was gone, launch after launch. The
+# installer is x64 (frostbyte.iss allows x64compatible), so on ARM the whole
+# stack -- Python, Qt, Chromium, numpy -- runs under Windows' x64 emulation,
+# which no other check exercises. The Windows build's own launch check runs
+# on x64 and passed for the same installer.
+#
+# It lives here, not with the source, because it needs nothing but a
+# published installer, and Actions minutes are free in a public repo --
+# windows-11-arm included.
+#
+# The runner is not a Surface: it has no Adreno GPU (Chromium gets a basic
+# display adapter), but it has the emulation and the same 16 GB. So a crash
+# here points at emulation; a clean run here and a crash there points at the
+# GPU/driver, or at something on that one machine.
+#
+# Nothing is built and nothing is published. The artifact holds the app's log
+# and journal, fb_lastrun's crash reports (0.6.2+), Windows' crash/hang/
+# app-control/Defender events, WER reports, a timeline and a process census
+# per launch, and captures of the app's window (the runner's screen itself is
+# Windows' first-run privacy page).
+#
+# Runs on every published release, on a change to this file, and by hand:
+# Actions -> launch-check-arm -> Run workflow (tag, or latest).
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths: [.github/workflows/launch-check-arm.yml]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (v0.6.1 ...) or latest"
+        default: latest
+      watch_seconds:
+        description: "How long to watch the first launch"
+        default: "420"
+
+jobs:
+  arm-launch:
+    runs-on: windows-11-arm
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag || github.event.release.tag_name || 'latest' }}
+      WATCH_S: ${{ inputs.watch_seconds || '420' }}
+      GH_TOKEN: ${{ github.token }}
+      FROSTBYTE_NO_APP_UPDATES: "1"
+    defaults:
+      run:
+        # Windows PowerShell 5.1: always on the image. GitHub runs it with
+        # $ErrorActionPreference = 'stop', under which a native command's
+        # stderr is fatal, so the steps that run one set it back.
+        shell: powershell
+    steps:
+      - name: This machine
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $start = Get-Date
+          $start.ToString("o") | Out-File "$out\job-start.txt" -Encoding ascii
+          $info = @(
+            "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE",
+            "PROCESSOR_IDENTIFIER=$env:PROCESSOR_IDENTIFIER",
+            (Get-CimInstance Win32_Processor | Format-List Name, Architecture, NumberOfCores, NumberOfLogicalProcessors | Out-String),
+            (Get-CimInstance Win32_OperatingSystem | Format-List Caption, Version, BuildNumber, OSArchitecture, TotalVisibleMemorySize, FreePhysicalMemory | Out-String),
+            (Get-CimInstance Win32_VideoController | Format-List Name, DriverVersion, VideoModeDescription | Out-String),
+            ("Smart App Control (VerifiedAndReputablePolicyState): " +
+              (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState)
+          )
+          $info | Out-File "$out\sysinfo.txt" -Encoding utf8
+          Get-Content "$out\sysinfo.txt"
+
+      - name: Download the installer
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $h = @{ Authorization = "Bearer $env:GH_TOKEN"; "X-GitHub-Api-Version" = "2022-11-28" }
+          if ($env:TAG -eq "latest") { $api = "https://api.github.com/repos/$env:REPO/releases/latest" }
+          else { $api = "https://api.github.com/repos/$env:REPO/releases/tags/$env:TAG" }
+          # A release that has just been published may still be taking its
+          # assets: give the installer ten minutes to arrive.
+          foreach ($i in 1..20) {
+            $rel = Invoke-RestMethod -Headers $h -Uri $api
+            $asset = $rel.assets | Where-Object { $_.name -like "FrostByte-*-Setup.exe" -and $_.state -eq "uploaded" } | Select-Object -First 1
+            if ($asset) { break }
+            Write-Host "no FrostByte-*-Setup.exe on $env:REPO $($rel.tag_name) yet; waiting"
+            Start-Sleep -Seconds 30
+          }
+          if (-not $asset) { throw "no FrostByte-*-Setup.exe on $env:REPO $($rel.tag_name)" }
+          "$env:REPO $($rel.tag_name) $($asset.name)" | Out-File "$out\release.txt" -Encoding ascii
+          Write-Host "installing $env:REPO $($rel.tag_name): $($asset.name), $([math]::Round($asset.size / 1MB)) MB"
+          # curl drops the token when GitHub redirects the download to its CDN.
+          & curl.exe -fsSL -H "Authorization: Bearer $env:GH_TOKEN" -H "Accept: application/octet-stream" `
+            -o "$env:RUNNER_TEMP\setup.exe" $asset.url
+          if ($LASTEXITCODE) { throw "download failed ($LASTEXITCODE)" }
+
+      - name: Install it the way a user would
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $dir = Join-Path $env:RUNNER_TEMP "FrostByte"
+          $t = Get-Date
+          Start-Process "$env:RUNNER_TEMP\setup.exe" -Wait -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$dir", "/LOG=$out\install.log"
+          Write-Host ("installed in {0:N0} s" -f ((Get-Date) - $t).TotalSeconds)
+          if (-not (Test-Path "$dir\env\FrostByte.exe")) { throw "the installer did not lay down env\FrostByte.exe" }
+          # 0x8664 = x64 (emulated here), 0xAA64 = native ARM64.
+          $fs = [IO.File]::OpenRead("$dir\env\FrostByte.exe"); $br = New-Object IO.BinaryReader $fs
+          $fs.Seek(0x3C, 0) | Out-Null; $fs.Seek($br.ReadInt32() + 4, 0) | Out-Null
+          Write-Host ("FrostByte.exe machine type: 0x{0:X4}" -f $br.ReadUInt16()); $fs.Close()
+
+      - name: Each heavy library on its own, under emulation
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $e = Join-Path $env:RUNNER_TEMP "FrostByte\env"
+          $env:PATH = "$e;$e\Library\mingw-w64\bin;$e\Library\usr\bin;$e\Library\bin;$e\Scripts;$e\bin;$env:PATH"
+          $env:PYTHONNOUSERSITE = "1"; $env:PYTHONUTF8 = "1"
+          $rows = @()
+          foreach ($m in "numpy", "scipy", "pandas", "matplotlib", "pyproj", "shapely", "cartopy", "xarray",
+                         "netCDF4", "eccodes", "cfgrib", "metpy", "psutil", "PIL", "PyQt6.QtWidgets",
+                         "PyQt6.QtWebEngineWidgets") {
+            $t = Get-Date
+            $o = & "$e\python.exe" -X faulthandler -s -c "import $m; print('ok')" 2>&1 | Out-String
+            $rows += "{0,-26} exit 0x{1:X8}  {2,6:N1} s  {3}" -f $m, $LASTEXITCODE, ((Get-Date) - $t).TotalSeconds, (($o.Trim() -split "`n" | Select-Object -Last 2) -join " | ")
+          }
+          $rows += ""
+          $rows += (& "$e\python.exe" -s -c "import numpy; numpy.show_config()" 2>&1 | Out-String)
+          $rows | Out-File "$out\imports.txt" -Encoding utf8
+          Get-Content "$out\imports.txt"
+          exit 0
+
+      - name: Qt's web engine alone (software, then GPU)
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $e = Join-Path $env:RUNNER_TEMP "FrostByte\env"
+          $env:PATH = "$e;$e\Library\mingw-w64\bin;$e\Library\usr\bin;$e\Library\bin;$e\Scripts;$e\bin;$env:PATH"
+          $env:PYTHONNOUSERSITE = "1"; $env:PYTHONUTF8 = "1"
+          $py = @'
+          import os, sys, time, faulthandler
+          faulthandler.enable()
+          e = sys.prefix
+          for var, parts in (("QT_PLUGIN_PATH", ("Library", "lib", "qt6", "plugins")),
+                             ("QTWEBENGINEPROCESS_PATH", ("Library", "lib", "qt6", "QtWebEngineProcess.exe")),
+                             ("QTWEBENGINE_RESOURCES_PATH", ("Library", "share", "qt6", "resources")),
+                             ("QTWEBENGINE_LOCALES_PATH", ("Library", "share", "qt6", "translations", "qtwebengine_locales"))):
+              p = os.path.join(e, *parts)
+              if os.path.exists(p):
+                  os.environ[var] = p
+          os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = sys.argv[1] if len(sys.argv) > 1 else ""
+          os.environ["QT_FORCE_STDERR_LOGGING"] = "1"
+          from PyQt6.QtWebEngineWidgets import QWebEngineView
+          from PyQt6.QtWidgets import QApplication
+          from PyQt6.QtCore import QTimer
+          app = QApplication(sys.argv[:1])
+          v = QWebEngineView(); v.resize(900, 520); v.show()
+          js = ("(()=>{const c=document.createElement('canvas');"
+                "const g=c.getContext('webgl2')||c.getContext('webgl');"
+                "return (g?'webgl: '+g.getParameter(g.RENDERER):'no webgl')+' | '+navigator.userAgent})()")
+          t0 = time.time()
+          def loaded(ok):
+              print("loadFinished=%s after %.1f s" % (ok, time.time() - t0), flush=True)
+              v.page().runJavaScript(js, lambda r: (print("page says:", r, flush=True),
+                                                    QTimer.singleShot(3000, app.quit)))
+          v.loadFinished.connect(loaded)
+          v.setHtml("<body style='background:#135;color:#fff'><h1>FrostByte ARM web-engine check</h1></body>")
+          QTimer.singleShot(90000, app.quit)
+          app.exec()
+          print("exited the event loop after %.1f s" % (time.time() - t0), flush=True)
+          '@
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP\webcheck.py", $py)
+          foreach ($flags in "--disable-gpu", "") {
+            $name = if ($flags) { "software" } else { "gpu" }
+            $t = Get-Date
+            $o = & "$e\python.exe" -s "$env:RUNNER_TEMP\webcheck.py" $flags 2>&1 | Out-String
+            $res = "== web engine, $name ('$flags'): exit 0x{0:X8} after {1:N1} s`n{2}" -f $LASTEXITCODE, ((Get-Date) - $t).TotalSeconds, $o
+            $res | Out-File "$out\webengine-$name.txt" -Encoding utf8
+            Write-Host $res
+          }
+          exit 0
+
+      - name: Launch it like a user, and watch
+        id: launch
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $dir = Join-Path $env:RUNNER_TEMP "FrostByte"
+          $cfg = Join-Path $env:APPDATA "frostbyte"
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          # The runner's screen is Windows' first-run privacy page, over
+          # everything, so a screen grab shows only that. PrintWindow asks the
+          # app's own window to draw itself, covered or not.
+          $src = @'
+          using System; using System.Drawing; using System.Runtime.InteropServices;
+          public static class WinShot {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+            [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+            public static Bitmap Grab(IntPtr h) {
+              RECT r;
+              if (!GetWindowRect(h, out r)) return null;
+              int w = r.R - r.L, ht = r.B - r.T;
+              if (w <= 0 || ht <= 0) return null;
+              Bitmap bmp = new Bitmap(w, ht);
+              bool ok;
+              using (Graphics g = Graphics.FromImage(bmp)) {
+                IntPtr dc = g.GetHdc();
+                ok = PrintWindow(h, dc, 2);   // PW_RENDERFULLCONTENT
+                g.ReleaseHdc(dc);
+              }
+              if (!ok) { bmp.Dispose(); return null; }
+              return bmp;
+            }
+          }
+          '@
+          try { Add-Type -TypeDefinition $src -ReferencedAssemblies System.Drawing }
+          catch { Write-Host "window capture unavailable: $_" }
+          $canGrab = [bool]('WinShot' -as [type])
+          # The app's window when there is one ($name.png), else the whole
+          # screen ($name-screen.png, most likely the privacy page).
+          function Shot($name, $appPid) {
+            try {
+              if ($canGrab -and $appPid) {
+                $p = Get-Process -Id $appPid -ErrorAction SilentlyContinue
+                if ($p -and $p.MainWindowHandle -ne [IntPtr]::Zero) {
+                  $bmp = [WinShot]::Grab($p.MainWindowHandle)
+                  if ($bmp) { $bmp.Save("$out\$name.png"); $bmp.Dispose(); return }
+                }
+              }
+              $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+              $bmp.Save("$out\$name-screen.png"); $g.Dispose(); $bmp.Dispose()
+            } catch { Write-Host "screenshot $name failed: $_" }
+          }
+          # Windows PowerShell 5.1 unrolls an array a function returns, and a
+          # lone CimInstance there has no .Count, so ONE running app counted
+          # as none: on 2026-09-29 0.6.1 ran for seven minutes and read "NEVER
+          # STARTED", was never stopped, and launch 2 was scored on it. Every
+          # call to Ours is wrapped in @().
+          #
+          # Ours: every process running an image from the install -- the app
+          # (FrostByte.exe), its lanes and Chromium's QtWebEngineProcess.exe.
+          function Ours { Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$dir\*" } }
+          # The app THIS launch started: an install image running
+          # frostbyte_gui.py born after $since (never a leftover), or failing
+          # that the live pid the app wrote into its own log header.
+          function Find($since) {
+            $p = @(@(Ours) | Where-Object { $_.CommandLine -like "*frostbyte_gui.py*" -and $_.CreationDate -ge $since } |
+                   Sort-Object CreationDate)
+            if ($p.Count) { return @{ Id = [int]$p[0].ProcessId; Name = $p[0].Name; By = "the process list" } }
+            $log = "$cfg\logs\frostbyte.log"
+            if (Test-Path $log) {
+              $hdr = @(Select-String -Path $log -Pattern '^=== FrostByte (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+pid=(\d+)')
+              if ($hdr.Count) {
+                $m = $hdr[-1].Matches[0]
+                $at = [datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $null)
+                $q = Get-Process -Id ([int]$m.Groups[2].Value) -ErrorAction SilentlyContinue
+                if ($q -and $at -ge $since.AddSeconds(-2)) { return @{ Id = $q.Id; Name = "$($q.ProcessName).exe"; By = "its log" } }
+              }
+            }
+            return $null
+          }
+          # Stop everything from the install; the count still running after.
+          function StopAll {
+            foreach ($i in 1..4) {
+              $p = @(Ours)
+              if (-not $p.Count) { return 0 }
+              foreach ($x in $p) { Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue }
+              Start-Sleep -Seconds 3
+            }
+            return @(Ours).Count
+          }
+          function Watch($label, $seconds, $shots) {
+            $t0 = Get-Date
+            Start-Process "$dir\launch.bat" -WorkingDirectory $dir
+            $app = $null; $end = "still running after $seconds s"; $lines = @()
+            # procs-<label>.txt: every install process as it first appears, so
+            # a crash event's pid can be named (a lane, Chromium, the app).
+            $born = @{}; $census = @()
+            $pending = New-Object System.Collections.ArrayList
+            foreach ($x in $shots) { [void]$pending.Add($x) }
+            while (((Get-Date) - $t0).TotalSeconds -lt $seconds) {
+              Start-Sleep -Seconds 5
+              $s = [int]((Get-Date) - $t0).TotalSeconds
+              $free = [int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024)
+              $procs = @(Ours)
+              foreach ($p in $procs) {
+                $id = [int]$p.ProcessId
+                if (-not $born.ContainsKey($id)) {
+                  $born[$id] = $true
+                  $cl = "$($p.CommandLine)"
+                  if ($cl.Length -gt 300) { $cl = $cl.Substring(0, 300) }
+                  $census += "{0,4} s  pid {1,6}  parent {2,6}  {3,-24} {4}" -f $s, $id, $p.ParentProcessId, $p.Name, $cl
+                }
+              }
+              $last = ""
+              if (Test-Path "$cfg\logs\frostbyte.log") {
+                $last = (Get-Content "$cfg\logs\frostbyte.log" -Tail 1 -ErrorAction SilentlyContinue) -join ""
+                if ($last.Length -gt 110) { $last = $last.Substring(0, 110) }
+              }
+              if (-not $app) { $app = Find $t0 }
+              $alive = $null
+              if ($app) { $alive = Get-Process -Id $app.Id -ErrorAction SilentlyContinue }
+              if ($alive) {
+                $mb = [int]($alive.WorkingSet64 / 1MB)
+                $kids = @($procs | Where-Object { $_.ParentProcessId -eq $app.Id }).Count
+                $all = [int](($procs | Measure-Object -Property WorkingSetSize -Sum).Sum / 1MB)
+                $lines += "{0,4} s  up    app {1,5} MB  children {2,2}  all {3,3} procs {4,5} MB  free {5,6} MB  | {6}" -f $s, $mb, $kids, $procs.Count, $all, $free, $last
+              } elseif ($app) {
+                $lines += "{0,4} s  GONE  {1,3} procs left  free {2,6} MB  | {3}" -f $s, $procs.Count, $free, $last
+                $end = "DIED about $s s after launch ($($app.Name) pid $($app.Id))"
+                Shot "$label-after-death" $null
+                break
+              } else {
+                $lines += "{0,4} s  not started  {1,3} procs  free {2,6} MB" -f $s, $procs.Count, $free
+              }
+              while ($pending.Count -and $s -ge $pending[0]) {
+                Shot ("$label-{0:D3}s" -f $pending[0]) $(if ($app) { $app.Id })
+                $pending.RemoveAt(0)
+              }
+            }
+            if (-not $app) { $end = "NEVER STARTED (nothing from the install ran frostbyte_gui.py, and its log names no live pid)" }
+            elseif ($end -like "still running*") { $end += " ($($app.Name) pid $($app.Id), found by $($app.By))" }
+            Shot "$label-end" $(if ($app) { $app.Id })
+            $lines += "==> $label : $end"
+            $lines | Out-File "$out\timeline-$label.txt" -Encoding utf8
+            $census | Out-File "$out\procs-$label.txt" -Encoding utf8
+            $lines | ForEach-Object { Write-Host $_ }
+            return $end
+          }
+          $first = Watch "launch1" ([int]$env:WATCH_S) @(20, 45, 90, 150, 240, 330)
+          $left = StopAll
+          if ($left) { Write-Host "::warning::$left process(es) from launch 1 would not stop" }
+          # A launch WE ended must not look like a crash to the next one (0.6.2+
+          # would stop on its "didn't finish starting" box, which nobody clicks).
+          # One that died on its own keeps its record: launch 2 should report it.
+          if ($first -like "still running*" -and (Test-Path "$cfg\launch_state.json")) {
+            Copy-Item "$cfg\launch_state.json" "$out\launch_state-launch1.json"
+            Remove-Item "$cfg\launch_state.json"
+          }
+          $second = Watch "launch2" 240 @(30, 90, 180)
+          $left = StopAll
+          if ($left) { Write-Host "::warning::$left process(es) from launch 2 would not stop" }
+          "launch 1: $first`nlaunch 2: $second" | Out-File "$out\outcome.txt" -Encoding utf8
+          # .NET writes UTF-8 without a BOM; 5.1's Out-File would add one.
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT, "first=$first`n")
+          exit 0
+
+      - name: The same start through python.exe, whose output can be read
+        if: ${{ !startsWith(steps.launch.outputs.first, 'still running') }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          $dir = Join-Path $env:RUNNER_TEMP "FrostByte"
+          $e = "$dir\env"
+          $env:FROSTBYTE_HOME = "$dir\app"; $env:FROSTBYTE_BASE_HOME = "$dir\app"
+          $env:PYTHONNOUSERSITE = "1"; $env:PYTHONUTF8 = "1"; $env:PYTHONIOENCODING = "utf-8"
+          $env:PATH = "$e;$e\Library\mingw-w64\bin;$e\Library\usr\bin;$e\Library\bin;$e\Scripts;$e\bin;$env:PATH"
+          $env:ECCODES_DEFINITION_PATH = "$e\Library\share\eccodes\definitions"
+          $p = Start-Process "$e\python.exe" -ArgumentList '-X', 'faulthandler', '-s', "`"$dir\app\frostbyte_gui.py`"" `
+            -WorkingDirectory "$dir\app" -RedirectStandardOutput "$out\console.out" -RedirectStandardError "$out\console.err" -PassThru
+          # Same census as the launches (procs-python.txt).
+          $t0 = Get-Date; $born = @{}; $census = @()
+          while (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt 300) {
+            Start-Sleep -Seconds 5
+            $s = [int]((Get-Date) - $t0).TotalSeconds
+            foreach ($q in @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$dir\*" })) {
+              $id = [int]$q.ProcessId
+              if (-not $born.ContainsKey($id)) {
+                $born[$id] = $true
+                $cl = "$($q.CommandLine)"
+                if ($cl.Length -gt 300) { $cl = $cl.Substring(0, 300) }
+                $census += "{0,4} s  pid {1,6}  parent {2,6}  {3,-24} {4}" -f $s, $id, $q.ParentProcessId, $q.Name, $cl
+              }
+            }
+          }
+          $census | Out-File "$out\procs-python.txt" -Encoding utf8
+          if ($p.HasExited) { Write-Host ("python.exe exited with 0x{0:X8}" -f $p.ExitCode) }
+          else { Write-Host "python.exe still running after 300 s" }
+          foreach ($q in @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$dir\*" })) {
+            Stop-Process -Id $q.ProcessId -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "---- stderr (tail)"; Get-Content "$out\console.err" -Tail 120 -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: Collect what Windows and the app recorded
+        if: always()
+        run: |
+          $ErrorActionPreference = "Continue"
+          $out = Join-Path $env:RUNNER_TEMP "arm-check"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          $start = (Get-Date).AddHours(-2)
+          if (Test-Path "$out\job-start.txt") { $start = [datetime](Get-Content "$out\job-start.txt") }
+          $cfg = Join-Path $env:APPDATA "frostbyte"
+          if (Test-Path $cfg) {
+            New-Item -ItemType Directory -Force "$out\appdata" | Out-Null
+            foreach ($x in "logs", "crash-reports", "errors.jsonl", "launch_state.json", "gpu_probe.json", "settings.json") {
+              if (Test-Path "$cfg\$x") { Copy-Item -Recurse -Force "$cfg\$x" "$out\appdata\" }
+            }
+          }
+          $ev = @()
+          foreach ($q in @(
+              @{ LogName = "Application"; ProviderName = "Application Error", "Application Hang", "Windows Error Reporting"; StartTime = $start },
+              @{ LogName = "Microsoft-Windows-CodeIntegrity/Operational"; Id = 3033, 3077; StartTime = $start },
+              @{ LogName = "Microsoft-Windows-Windows Defender/Operational"; Id = 1116, 1117; StartTime = $start })) {
+            $ev += "==== $($q.LogName)"
+            $ev += (Get-WinEvent -FilterHashtable $q -ErrorAction SilentlyContinue |
+                    Format-List TimeCreated, Id, ProviderName, Message | Out-String -Width 400)
+          }
+          $ev | Out-File "$out\windows-events.txt" -Encoding utf8
+          New-Item -ItemType Directory -Force "$out\wer" | Out-Null
+          foreach ($w in "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive", "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportQueue",
+                         "$env:ProgramData\Microsoft\Windows\WER\ReportArchive", "$env:ProgramData\Microsoft\Windows\WER\ReportQueue") {
+            Get-ChildItem $w -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.LastWriteTime -ge $start -and $_.Name -match "FrostByte|python|QtWebEngine" } |
+              ForEach-Object { Copy-Item -Recurse -Force $_.FullName "$out\wer\" }
+          }
+          $sum = @("## FrostByte launch check on Windows on ARM", "")
+          if (Test-Path "$out\release.txt") { $sum += "Installed: ``$(Get-Content "$out\release.txt")``", "" }
+          if (Test-Path "$out\outcome.txt") { $sum += '```'; $sum += Get-Content "$out\outcome.txt"; $sum += '```' }
+          foreach ($f in "timeline-launch1.txt", "timeline-launch2.txt", "imports.txt", "webengine-software.txt", "webengine-gpu.txt") {
+            if (Test-Path "$out\$f") { $sum += "", "### $f", '```'; $sum += Get-Content "$out\$f" -TotalCount 80; $sum += '```' }
+          }
+          $crash = Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "Application Error"; StartTime = $start } -ErrorAction SilentlyContinue
+          $sum += "", "### Application Error events: $(@($crash).Count)"
+          foreach ($c in @($crash | Select-Object -First 5)) {
+            $sum += '```'; $sum += ($c.Message -split "`n" | Select-Object -First 8)
+            # Name the process from the census: the app, a lane, or Chromium.
+            if ($c.Message -match 'Faulting process id: 0x([0-9A-Fa-f]+)') {
+              $fp = [Convert]::ToInt32($Matches[1], 16)
+              $who = @(Get-ChildItem "$out\procs-*.txt" -ErrorAction SilentlyContinue |
+                       Select-String -Pattern "pid\s+$fp\s" | Select-Object -First 1)
+              if ($who.Count) { $sum += "pid $fp was: $($who[0].Filename): $($who[0].Line.Trim())" }
+              else { $sum += "pid $fp is not in any census" }
+            }
+            $sum += '```'
+          }
+          # Newest first: frostbyte.log is the last start (launch 2, or the
+          # python.exe run), and the first launch is a generation or two back.
+          foreach ($n in "", ".1", ".2", ".3") {
+            $f = "$cfg\logs\frostbyte.log$n"
+            if (Test-Path $f) {
+              $sum += "", "### frostbyte.log$n -- $((Get-Content $f -TotalCount 3 | Where-Object { $_ -like '=== FrostByte*' }) -join ' ')", '```'
+              $sum += Get-Content $f -Tail 45
+              $sum += '```'
+            }
+          }
+          [IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, ($sum -join "`n") + "`n")
+          Get-Content "$out\windows-events.txt" -TotalCount 150
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arm-launch-check
+          path: ${{ runner.temp }}/arm-check
+          if-no-files-found: warn
+
+      - name: Pass only if the app stayed up
+        run: |
+          $o = Get-Content (Join-Path $env:RUNNER_TEMP "arm-check\outcome.txt") -Raw
+          Write-Host $o
+          if ($o -match "DIED|NEVER STARTED") { throw "FrostByte did not stay up on Windows on ARM" }
