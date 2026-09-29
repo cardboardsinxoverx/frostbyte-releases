@@ -463,7 +463,10 @@ jobs:
             $sum += "", "### Boot stages (s)", '```', ("{0,-16} {1,9} {2,9}" -f "stage", "launch 1", "launch 2")
             foreach ($k in $t1.order) {
               $a = $t1.stages.$k.mean; $b = ""
-              if ($t2 -and $t2.stages.$k) { $b = "{0:N1}" -f (2 * $t2.stages.$k.mean - $a) }
+              # A stage launch 2 never reached (a wait satisfied before it was
+              # asked) keeps launch 1's number in the file: say so instead.
+              if ($t2 -and ($t2.order -contains $k)) { $b = "{0:N1}" -f (2 * $t2.stages.$k.mean - $a) }
+              elseif ($t2) { $b = "skipped" }
               $sum += "{0,-16} {1,9:N1} {2,9}" -f $k, $a, $b
             }
             $sum += "{0,-16} {1,9:N1} {2,9}" -f "total", $t1.last_total_s, $(if ($t2) { "{0:N1}" -f $t2.last_total_s })
