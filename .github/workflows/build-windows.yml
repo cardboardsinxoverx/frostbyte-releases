@@ -1,0 +1,195 @@
+name: build-windows
+
+# Builds the Windows .exe installer from the PRIVATE source repo, here, where
+# Actions minutes are free (Windows included). The private repo's own
+# build-windows is the same build; it stopped starting on 2026-09-29 when that
+# account's monthly minutes ran out.
+#
+# THE SOURCE comes in with FROSTBYTE_SOURCE_TOKEN: a fine-grained token with
+# Contents: read-only on cardboardsinxoverx/frostbyte and nothing else. Only
+# the one commit is fetched (the history stays private), and the token is not
+# kept in .git/config for the steps after the checkout. Everything a step
+# prints is public here, like any log in a public repo; the token is masked.
+#
+# Manual only, so the secret is never within reach of anyone else's trigger.
+# Actions -> build-windows -> Run workflow, with the source branch (or a
+# commit). Bump VERSION in the source and push it FIRST: the app is staged
+# with `git archive HEAD` and the .iss reads VERSION at compile time.
+#
+# THE RESULT is a DRAFT release v<VERSION> here, with the .exe on it. A draft
+# is visible only to people who can write to this repo, and nothing reads it
+# until it is published: add the .deb, the app-update files and the notes,
+# then publish. Re-running the same VERSION replaces the .exe on the draft.
+# A version whose release is already PUBLISHED is refused, not overwritten.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source branch or commit to build (cardboardsinxoverx/frostbyte)"
+        default: installer-build
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    permissions:
+      contents: write        # the draft release, in THIS repo
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: cardboardsinxoverx/frostbyte
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.FROSTBYTE_SOURCE_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Create the conda env (win-64) from environment.yml
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          environment-name: fb
+
+      - name: Add vendored packages + conda-pack
+        run: |
+          micromamba install -n fb -y conda-pack
+          python -m pip install --no-deps packaging/wheels/*.whl
+          # QtWebEngine bindings (pin + why: packaging/webengine-requirements.txt).
+          # Without this step the installer builds and passes every check
+          # and the app opens with no globe -- how the 0.4.0 .exe shipped.
+          python -s -m pip install --no-deps -r packaging/webengine-requirements.txt
+
+      - name: Smoke-test the environment
+        run: |
+          python -c "import cartopy, metpy, netCDF4, cfgrib, PyQt6.QtWidgets, sharppy, mplcursors, eumdac, tropycal; print('libs import OK')"
+          python -s -c "import PyQt6.QtWebEngineWidgets; print('QtWebEngine bindings load')"
+          QT_QPA_PLATFORM=offscreen FROSTBYTE_HOME="$PWD" python -c "import frostbyte_gui; print('GUI module imports OK')"
+          # The pip bindings look for QtWebEngineProcess in the empty pip layout;
+          # frostbyte_gui points them at conda's copy. If it finds none, the
+          # first web view aborts the app (every Windows build from 2026-09-17
+          # to the 0.5.8 installer did), so a layout change fails here, early.
+          QT_QPA_PLATFORM=offscreen FROSTBYTE_HOME="$PWD" python -c "
+          import os, frostbyte_gui
+          for v in ('QTWEBENGINEPROCESS_PATH', 'QTWEBENGINE_RESOURCES_PATH', 'QTWEBENGINE_LOCALES_PATH'):
+              p = os.environ.get(v)
+              assert p and os.path.exists(p), '%s not found (got %r)' % (v, p)
+              print(v, '=', p)
+          "
+          # Every product script's third-party imports must resolve (user-site
+          # disabled, matching the installed launcher's PYTHONNOUSERSITE=1).
+          python -s packaging/check_env_imports.py
+          # ...and the maps must land where the ground is. The env is solved
+          # fresh here, and PROJ 9.8 slipped into the 0.5.5-0.5.8 .exe that
+          # way: radar map lines ~21 km north, polar discs not drawing, every
+          # import fine. See packaging/check_env_geo.py.
+          python -s packaging/check_env_geo.py
+
+      - name: Pack the environment
+        run: conda-pack -p "$MAMBA_ROOT_PREFIX/envs/fb" -o fb-env.tar --format tar --ignore-missing-files --n-threads -1
+
+      - name: Assemble the build tree (env + app + launcher)
+        run: |
+          mkdir -p build/FrostByte/env build/FrostByte/app
+          # core.autocrlf=false: git archive applies the runner's line-ending
+          # conversion, and Windows runners default to CRLF. The app tree must
+          # be byte-for-byte the tree the .deb ships, because app updates
+          # (fb_appupdate) check the files already installed against one
+          # manifest built on Linux; a CRLF copy matches nothing and every
+          # Windows install would download the full tree instead of a delta.
+          git -c core.autocrlf=false archive HEAD | tar -x -C build/FrostByte/app
+          tar -xf fb-env.tar -C build/FrostByte/env
+          cp packaging/windows/launch.bat build/FrostByte/
+          cp packaging/windows/finalize_env.bat build/FrostByte/
+
+      # pythonw.exe renamed and stamped, so Task Manager says "FrostByte" (see
+      # the script for why that has to be a file and not a runtime call).
+      - name: Make FrostByte.exe
+        shell: pwsh
+        run: |
+          packaging\windows\make_app_exe.ps1 -EnvDir build\FrostByte\env `
+            -Icon icons\app\frostbyte.ico -Version (Get-Content VERSION -Raw)
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        shell: pwsh
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" packaging\windows\frostbyte.iss'
+
+      # Install what was just built, the way a user would, start it through the
+      # Start-menu launcher, and look at it the way Task Manager does. The
+      # runner has a desktop session, so the app draws normally; QtWebEngine
+      # has no offscreen mode on Windows. App updates are off so the installed
+      # tree is the one that runs. A GUI that dies on start fails here instead
+      # of on somebody's machine, and says why: the app's error journal, and
+      # the same start through console python.exe, whose output can be read.
+      - name: Install the .exe and start the app
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem dist\FrostByte-*-Setup.exe).FullName
+          $dir = Join-Path $env:RUNNER_TEMP "FrostByte"
+          Start-Process $setup -Wait -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER', "/DIR=$dir"
+          if (-not (Test-Path "$dir\env\FrostByte.exe")) { throw "the installer did not lay down env\FrostByte.exe" }
+          $env:FROSTBYTE_NO_APP_UPDATES = "1"
+          Start-Process "$dir\launch.bat" -WorkingDirectory $dir
+          Start-Sleep -Seconds 90
+          $all = Get-CimInstance Win32_Process |
+            Where-Object { $_.Name -in 'FrostByte.exe', 'pythonw.exe', 'python.exe' }
+          $all | ForEach-Object { "{0,-14} {1,6}  {2}" -f $_.Name, $_.ProcessId, $_.CommandLine } | Write-Host
+          $gui = $all | Where-Object { $_.Name -eq 'FrostByte.exe' -and $_.CommandLine -like '*frostbyte_gui.py*' }
+          if (-not $gui) {
+            $env:FROSTBYTE_HOME = "$dir\app"
+            $env:FROSTBYTE_BASE_HOME = "$dir\app"
+            $env:PYTHONNOUSERSITE = "1"
+            $env:PYTHONUTF8 = "1"
+            $e = "$dir\env"
+            $env:PATH = "$e;$e\Library\mingw-w64\bin;$e\Library\usr\bin;$e\Library\bin;$e\Scripts;$e\bin;$env:PATH"
+            Write-Host "---- the app's error journal"
+            & "$e\python.exe" -s -c "import sys; sys.path.insert(0, r'$dir\app'); import fb_sources, fb_errlog; print(fb_errlog.path()); print(fb_errlog.as_text()[-8000:])"
+            Write-Host "---- the same start through python.exe (60 s)"
+            $o = Join-Path $env:RUNNER_TEMP "gui.out"; $r = Join-Path $env:RUNNER_TEMP "gui.err"
+            $p = Start-Process "$e\python.exe" -ArgumentList '-s', "`"$dir\app\frostbyte_gui.py`"" `
+              -WorkingDirectory "$dir\app" -RedirectStandardOutput $o -RedirectStandardError $r -PassThru
+            Start-Sleep -Seconds 60
+            Write-Host "python.exe still running after 60 s: $(-not $p.HasExited)  exit code: $(if ($p.HasExited) { $p.ExitCode })"
+            Write-Host "---- stdout"; Get-Content $o -Tail 80 -ErrorAction SilentlyContinue
+            Write-Host "---- stderr"; Get-Content $r -Tail 120 -ErrorAction SilentlyContinue
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+            throw "no FrostByte.exe running frostbyte_gui.py after 90 s"
+          }
+          Get-Process -Name FrostByte | Format-Table Id, ProcessName, Description, WorkingSet64 -AutoSize | Out-String | Write-Host
+          $desc = (Get-Process -Id $gui[0].ProcessId).Description
+          if ($desc -ne 'FrostByte') { throw "Task Manager would call it '$desc'" }
+          $strays = $all | Where-Object { $_.Name -ne 'FrostByte.exe' -and $_.CommandLine -like "*$dir*" }
+          if ($strays) { Write-Host "::warning::app processes still starting as Python: $($strays.Name -join ', ')" }
+          Get-Process -Name FrostByte -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Read the version and the commit built
+        id: ver
+        run: |
+          echo "v=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Put the .exe on the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.ver.outputs.v }}
+          VER: ${{ steps.ver.outputs.v }}
+          SHA: ${{ steps.ver.outputs.sha }}
+        run: |
+          exe=$(ls dist/FrostByte-*-Setup.exe)
+          state=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || echo none)
+          if [ "$state" = "false" ]; then
+            echo "::error::$TAG is already published here; bump VERSION rather than replace a released installer."
+            exit 1
+          elif [ "$state" = "true" ]; then
+            gh release upload "$TAG" "$exe" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$exe" -R "$GITHUB_REPOSITORY" --draft \
+              --title "FrostByte $VER (beta)" \
+              --notes "Draft. Windows installer built from source commit ${SHA:0:7}. Add the .deb, the app-update files and the notes, then publish."
+          fi
+          echo "draft $TAG: $(basename "$exe") from source ${SHA:0:7}"
